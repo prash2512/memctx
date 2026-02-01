@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -24,6 +25,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&ollamaURL, "ollama", "http://localhost:11434", "ollama base URL")
 	rootCmd.AddCommand(uploadCmd)
 	rootCmd.AddCommand(primeCmd)
+	rootCmd.AddCommand(listCmd)
 }
 
 var rootCmd = &cobra.Command{
@@ -75,6 +77,38 @@ var uploadCmd = &cobra.Command{
 		}
 
 		fmt.Printf("Uploaded: %s (%d bytes, %d dims)\n", id[:8], len(content), len(embedding))
+		return nil
+	},
+}
+
+var listCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List stored conversations",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		store, err := NewStore(dbPath)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+
+		convs, err := store.List()
+		if err != nil {
+			return err
+		}
+
+		if len(convs) == 0 {
+			fmt.Println("No conversations stored.")
+			return nil
+		}
+
+		for _, c := range convs {
+			preview := c.Content
+			if len(preview) > 60 {
+				preview = preview[:60] + "..."
+			}
+			preview = strings.ReplaceAll(preview, "\n", " ")
+			fmt.Printf("%s  %s  %s\n", c.ID[:8], c.CreatedAt.Format("2006-01-02"), preview)
+		}
 		return nil
 	},
 }
