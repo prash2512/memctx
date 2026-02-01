@@ -1,19 +1,17 @@
 package main
 
 import (
-	"encoding/binary"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math"
 	"time"
 
-	"github.com/ncruces/go-sqlite3"
-	_ "github.com/ncruces/go-sqlite3/embed"
-
-	_ "github.com/asg017/sqlite-vec-go-bindings/ncruces"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type Store struct {
-	conn *sqlite3.Conn
+	db *sql.DB
 }
 
 type Conversation struct {
@@ -22,17 +20,18 @@ type Conversation struct {
 	CreatedAt time.Time
 }
 
-const embeddingDim = 768 // nomic-embed-text dimension
-
 func NewStore(path string) (*Store, error) {
-	conn, err := sqlite3.Open(path)
+	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 
-	s := &Store{conn: conn}
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("ping db: %w", err)
+	}
+
+	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 
@@ -40,55 +39,36 @@ func NewStore(path string) (*Store, error) {
 }
 
 func (s *Store) migrate() error {
-	err := s.conn.Exec(`
+	_, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS conversations (
 			id TEXT PRIMARY KEY,
 			content TEXT NOT NULL,
+			embedding TEXT,
 			created_at DATETIME NOT NULL
 		)
 	`)
-	if err != nil {
-		return err
-	}
-
-	err = s.conn.Exec(fmt.Sprintf(`
-		CREATE VIRTUAL TABLE IF NOT EXISTS embeddings USING vec0(
-			id TEXT PRIMARY KEY,
-			embedding float[%d]
-		)
-	`, embeddingDim))
 	return err
 }
 
 func (s *Store) Save(c Conversation) error {
-	stmt, _, err := s.conn.Prepare(`INSERT OR REPLACE INTO conversations (id, content, created_at) VALUES (?, ?, ?)`)
+	_, err := s.db.Exec(
+		`INSERT OR REPLACE INTO conversations (id, content, created_at) VALUES (?, ?, ?)`,
+		c.ID, c.Content, c.CreatedAt.Format(time.RFC3339),
+	)
 	if err != nil {
-		return fmt.Errorf("prepare: %w", err)
-	}
-	defer stmt.Close()
-
-	stmt.BindText(1, c.ID)
-	stmt.BindText(2, c.Content)
-	stmt.BindText(3, c.CreatedAt.Format(time.RFC3339))
-
-	if err := stmt.Exec(); err != nil {
 		return fmt.Errorf("insert conversation: %w", err)
 	}
 	return nil
 }
 
 func (s *Store) SaveEmbedding(id string, embedding []float32) error {
-	stmt, _, err := s.conn.Prepare(`INSERT OR REPLACE INTO embeddings (id, embedding) VALUES (?, ?)`)
+	data, err := json.Marshal(embedding)
 	if err != nil {
-		return fmt.Errorf("prepare: %w", err)
+		return err
 	}
-	defer stmt.Close()
-
-	stmt.BindText(1, id)
-	stmt.BindBlob(2, float32ToBytes(embedding))
-
-	if err := stmt.Exec(); err != nil {
-		return fmt.Errorf("insert embedding: %w", err)
+	_, err = s.db.Exec(`UPDATE conversations SET embedding = ? WHERE id = ?`, string(data), id)
+	if err != nil {
+		return fmt.Errorf("save embedding: %w", err)
 	}
 	return nil
 }
@@ -98,86 +78,97 @@ type SearchResult struct {
 	Distance float64
 }
 
-func (s *Store) Search(embedding []float32, limit int) ([]SearchResult, error) {
-	stmt, _, err := s.conn.Prepare(`
-		SELECT id, distance 
-		FROM embeddings 
-		WHERE embedding MATCH ? 
-		ORDER BY distance 
-		LIMIT ?
-	`)
+func (s *Store) Search(query []float32, limit int) ([]SearchResult, error) {
+	rows, err := s.db.Query(`SELECT id, embedding FROM conversations WHERE embedding IS NOT NULL`)
 	if err != nil {
-		return nil, fmt.Errorf("prepare: %w", err)
+		return nil, fmt.Errorf("query: %w", err)
 	}
-	defer stmt.Close()
-
-	stmt.BindBlob(1, float32ToBytes(embedding))
-	stmt.BindInt(2, limit)
+	defer rows.Close()
 
 	var results []SearchResult
-	for stmt.Step() {
-		results = append(results, SearchResult{
-			ID:       stmt.ColumnText(0),
-			Distance: stmt.ColumnFloat(1),
-		})
+	for rows.Next() {
+		var id, embJSON string
+		if err := rows.Scan(&id, &embJSON); err != nil {
+			continue
+		}
+
+		var emb []float32
+		if err := json.Unmarshal([]byte(embJSON), &emb); err != nil {
+			continue
+		}
+
+		dist := cosineDistance(query, emb)
+		results = append(results, SearchResult{ID: id, Distance: dist})
 	}
-	if err := stmt.Err(); err != nil {
-		return nil, fmt.Errorf("search: %w", err)
+
+	// Sort by distance (ascending)
+	for i := 0; i < len(results); i++ {
+		for j := i + 1; j < len(results); j++ {
+			if results[j].Distance < results[i].Distance {
+				results[i], results[j] = results[j], results[i]
+			}
+		}
+	}
+
+	if len(results) > limit {
+		results = results[:limit]
 	}
 	return results, nil
 }
 
 func (s *Store) List() ([]Conversation, error) {
-	stmt, _, err := s.conn.Prepare(`SELECT id, content, created_at FROM conversations ORDER BY created_at DESC`)
+	rows, err := s.db.Query(`SELECT id, content, created_at FROM conversations ORDER BY created_at DESC`)
 	if err != nil {
-		return nil, fmt.Errorf("prepare: %w", err)
+		return nil, fmt.Errorf("query: %w", err)
 	}
-	defer stmt.Close()
+	defer rows.Close()
 
 	var convs []Conversation
-	for stmt.Step() {
-		t, _ := time.Parse(time.RFC3339, stmt.ColumnText(2))
-		convs = append(convs, Conversation{
-			ID:        stmt.ColumnText(0),
-			Content:   stmt.ColumnText(1),
-			CreatedAt: t,
-		})
+	for rows.Next() {
+		var c Conversation
+		var ts string
+		if err := rows.Scan(&c.ID, &c.Content, &ts); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+		c.CreatedAt, _ = time.Parse(time.RFC3339, ts)
+		convs = append(convs, c)
 	}
-	if err := stmt.Err(); err != nil {
-		return nil, fmt.Errorf("list: %w", err)
-	}
-	return convs, nil
+	return convs, rows.Err()
 }
 
 func (s *Store) Get(id string) (Conversation, error) {
-	stmt, _, err := s.conn.Prepare(`SELECT id, content, created_at FROM conversations WHERE id = ?`)
+	var c Conversation
+	var ts string
+	err := s.db.QueryRow(
+		`SELECT id, content, created_at FROM conversations WHERE id = ?`, id,
+	).Scan(&c.ID, &c.Content, &ts)
 	if err != nil {
-		return Conversation{}, fmt.Errorf("prepare: %w", err)
+		return c, fmt.Errorf("get conversation %s: %w", id, err)
 	}
-	defer stmt.Close()
-
-	stmt.BindText(1, id)
-
-	if !stmt.Step() {
-		return Conversation{}, fmt.Errorf("conversation %s not found", id)
-	}
-
-	t, _ := time.Parse(time.RFC3339, stmt.ColumnText(2))
-	return Conversation{
-		ID:        stmt.ColumnText(0),
-		Content:   stmt.ColumnText(1),
-		CreatedAt: t,
-	}, stmt.Err()
+	c.CreatedAt, _ = time.Parse(time.RFC3339, ts)
+	return c, nil
 }
 
 func (s *Store) Close() error {
-	return s.conn.Close()
+	return s.db.Close()
 }
 
-func float32ToBytes(v []float32) []byte {
-	buf := make([]byte, len(v)*4)
-	for i, f := range v {
-		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(f))
+func cosineDistance(a, b []float32) float64 {
+	if len(a) != len(b) {
+		return 1.0
 	}
-	return buf
+
+	var dot, normA, normB float64
+	for i := range a {
+		dot += float64(a[i]) * float64(b[i])
+		normA += float64(a[i]) * float64(a[i])
+		normB += float64(b[i]) * float64(b[i])
+	}
+
+	if normA == 0 || normB == 0 {
+		return 1.0
+	}
+
+	similarity := dot / (math.Sqrt(normA) * math.Sqrt(normB))
+	return 1.0 - similarity
 }

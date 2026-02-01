@@ -20,3 +20,6 @@ memctx
 # Database (local dev)
 *.db
 
+# Test files
+test-*.txt
+
