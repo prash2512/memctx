@@ -11,13 +11,17 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var dbPath string
+var (
+	dbPath    string
+	ollamaURL string
+)
 
 func init() {
 	home, _ := os.UserHomeDir()
 	defaultDB := filepath.Join(home, ".memctx.db")
 
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", defaultDB, "database path")
+	rootCmd.PersistentFlags().StringVar(&ollamaURL, "ollama", "http://localhost:11434", "ollama base URL")
 	rootCmd.AddCommand(uploadCmd)
 }
 
@@ -48,6 +52,12 @@ var uploadCmd = &cobra.Command{
 		}
 		defer store.Close()
 
+		ollama := NewOllama(ollamaURL, "nomic-embed-text")
+		embedding, err := ollama.Embed(string(content))
+		if err != nil {
+			return fmt.Errorf("embed: %w", err)
+		}
+
 		id := hashContent(content)
 		conv := Conversation{
 			ID:        id,
@@ -59,7 +69,11 @@ var uploadCmd = &cobra.Command{
 			return err
 		}
 
-		fmt.Printf("Uploaded: %s (%d bytes)\n", id[:8], len(content))
+		if err := store.SaveEmbedding(id, embedding); err != nil {
+			return err
+		}
+
+		fmt.Printf("Uploaded: %s (%d bytes, %d dims)\n", id[:8], len(content), len(embedding))
 		return nil
 	},
 }
