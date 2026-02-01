@@ -1,0 +1,28 @@
+# memctx Project Rules
+
+## Commit Messages
+- Short, 1-2 sentences max
+- Start with capital letter
+- No prefixes (no feat:, chore:, fix:, etc.)
+- Like a human would write at 11pm
+
+## Code Quality
+- No over-commenting — code explains itself
+- No unnecessary interfaces — concrete types until abstraction is needed
+- Real error messages with context
+- Consistent style — gofmt, short variable names, early returns
+- No god functions — small, focused
+- No LLM tells (generic names, boilerplate-heavy, over-engineered)
+
+## Project Scope (1-week MVP)
+- CLI only, no HTTP server
+- 3 commands: upload, prime, list
+- SQLite + sqlite-vec + Ollama
+- No Docker for MVP
+- Flat file structure
+
+## Review Style
+- User reviews high-level only
+- LLM drives implementation
+- Iterate fast
+
