@@ -9,6 +9,9 @@ memctx
 .vscode/
 *.swp
 
+# Cursor rules (personal)
+.cursorrules
+
 # OS
 .DS_Store
 
