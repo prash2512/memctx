@@ -20,6 +20,13 @@ type Conversation struct {
 	CreatedAt time.Time
 }
 
+type Chunk struct {
+	ID       string
+	ConvID   string
+	Content  string
+	Position int
+}
+
 func NewStore(path string) (*Store, error) {
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
@@ -47,6 +54,25 @@ func (s *Store) migrate() error {
 			created_at DATETIME NOT NULL
 		)
 	`)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS chunks (
+			id TEXT PRIMARY KEY,
+			conv_id TEXT NOT NULL,
+			content TEXT NOT NULL,
+			position INTEGER NOT NULL,
+			embedding TEXT,
+			FOREIGN KEY (conv_id) REFERENCES conversations(id)
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_chunks_conv_id ON chunks(conv_id)`)
 	return err
 }
 
@@ -73,12 +99,31 @@ func (s *Store) SaveEmbedding(id string, embedding []float32) error {
 	return nil
 }
 
+func (s *Store) SaveChunk(c Chunk) error {
+	_, err := s.db.Exec(
+		`INSERT OR REPLACE INTO chunks (id, conv_id, content, position) VALUES (?, ?, ?, ?)`,
+		c.ID, c.ConvID, c.Content, c.Position,
+	)
+	return err
+}
+
+func (s *Store) SaveChunkEmbedding(id string, embedding []float32) error {
+	data, err := json.Marshal(embedding)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE chunks SET embedding = ? WHERE id = ?`, string(data), id)
+	return err
+}
+
 type SearchResult struct {
 	ID       string
+	ConvID   string
+	Content  string
 	Distance float64
 }
 
-func (s *Store) Search(query []float32, limit int) ([]SearchResult, error) {
+func (s *Store) Search(query []float32, limit int, threshold float64) ([]SearchResult, error) {
 	rows, err := s.db.Query(`SELECT id, embedding FROM conversations WHERE embedding IS NOT NULL`)
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)
@@ -98,7 +143,10 @@ func (s *Store) Search(query []float32, limit int) ([]SearchResult, error) {
 		}
 
 		dist := cosineDistance(query, emb)
-		results = append(results, SearchResult{ID: id, Distance: dist})
+		// Only include results below threshold (lower distance = more similar)
+		if dist < threshold {
+			results = append(results, SearchResult{ID: id, ConvID: id, Distance: dist})
+		}
 	}
 
 	// Sort by distance (ascending)
@@ -114,6 +162,53 @@ func (s *Store) Search(query []float32, limit int) ([]SearchResult, error) {
 		results = results[:limit]
 	}
 	return results, nil
+}
+
+// SearchChunks searches across all chunks and returns best matches
+func (s *Store) SearchChunks(query []float32, limit int, threshold float64) ([]SearchResult, error) {
+	rows, err := s.db.Query(`SELECT id, conv_id, content, embedding FROM chunks WHERE embedding IS NOT NULL`)
+	if err != nil {
+		return nil, fmt.Errorf("query chunks: %w", err)
+	}
+	defer rows.Close()
+
+	var results []SearchResult
+	for rows.Next() {
+		var id, convID, content, embJSON string
+		if err := rows.Scan(&id, &convID, &content, &embJSON); err != nil {
+			continue
+		}
+
+		var emb []float32
+		if err := json.Unmarshal([]byte(embJSON), &emb); err != nil {
+			continue
+		}
+
+		dist := cosineDistance(query, emb)
+		if dist < threshold {
+			results = append(results, SearchResult{ID: id, ConvID: convID, Content: content, Distance: dist})
+		}
+	}
+
+	// Sort by distance (ascending)
+	for i := 0; i < len(results); i++ {
+		for j := i + 1; j < len(results); j++ {
+			if results[j].Distance < results[i].Distance {
+				results[i], results[j] = results[j], results[i]
+			}
+		}
+	}
+
+	if len(results) > limit {
+		results = results[:limit]
+	}
+	return results, nil
+}
+
+func (s *Store) HasChunks() bool {
+	var count int
+	s.db.QueryRow(`SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL`).Scan(&count)
+	return count > 0
 }
 
 func (s *Store) List() ([]Conversation, error) {
